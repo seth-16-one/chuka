@@ -1,4 +1,5 @@
 import { createClient, type Session, type User } from "npm:@supabase/supabase-js@2";
+import nodemailer from "npm:nodemailer@6.10.1";
 
 type SuccessPayload = {
   status: "ok";
@@ -21,12 +22,18 @@ const OTP_PATTERN = /^\d{6}$/;
 const MIN_PASSWORD_LENGTH = 6;
 type OtpPurpose = "login" | "signup" | "recovery";
 const ALLOWED_OTP_TYPES = new Set<OtpPurpose>(["login", "signup", "recovery"]);
+const OTP_COOLDOWN_SECONDS = Number(Deno.env.get("OTP_COOLDOWN_SECONDS") ?? "60");
 const OTP_EXPIRY_MINUTES = Number(Deno.env.get("OTP_EXPIRY_MINUTES") ?? "10");
 const OTP_MAX_ATTEMPTS = Number(Deno.env.get("OTP_MAX_ATTEMPTS") ?? "5");
 const OTP_HASH_SECRET = Deno.env.get("OTP_HASH_SECRET") ?? "change-me";
 const EMAIL_PROVIDER = (Deno.env.get("EMAIL_PROVIDER") ?? "").toLowerCase();
 const EMAIL_FROM_NAME = Deno.env.get("EMAIL_FROM_NAME") ?? "Chuka University";
 const EMAIL_FROM_ADDRESS = Deno.env.get("EMAIL_FROM_ADDRESS") ?? "no-reply@chuka.local";
+const SMTP_HOST = Deno.env.get("SMTP_HOST") ?? "";
+const SMTP_PORT = Number(Deno.env.get("SMTP_PORT") ?? "587");
+const SMTP_SECURE = (Deno.env.get("SMTP_SECURE") ?? "false").toLowerCase() === "true";
+const SMTP_USER = Deno.env.get("SMTP_USER") ?? "";
+const SMTP_PASS = Deno.env.get("SMTP_PASS") ?? "";
 const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY") ?? "";
 const SENDGRID_API_KEY = Deno.env.get("SENDGRID_API_KEY") ?? "";
 const APP_BASE_URL = Deno.env.get("APP_BASE_URL") ?? Deno.env.get("API_URL") ?? "";
@@ -318,6 +325,21 @@ function normalizePurpose(value: unknown): OtpPurpose {
   return value === "signup" || value === "recovery" || value === "login" ? value : "login";
 }
 
+function getCooldownSecondsRemaining(createdAt: string | null | undefined) {
+  if (!createdAt) {
+    return 0;
+  }
+
+  const sentAt = Date.parse(createdAt);
+
+  if (!Number.isFinite(sentAt)) {
+    return 0;
+  }
+
+  const elapsed = Math.floor((Date.now() - sentAt) / 1000);
+  return Math.max(0, OTP_COOLDOWN_SECONDS - elapsed);
+}
+
 function generateOtpCode() {
   const digits = crypto.getRandomValues(new Uint32Array(1))[0] % 1_000_000;
   return String(digits).padStart(6, "0");
@@ -398,7 +420,32 @@ function buildOtpEmailHtml(params: {
 async function sendOtpEmail(to: string, subject: string, html: string) {
   const from = `${EMAIL_FROM_NAME} <${EMAIL_FROM_ADDRESS}>`;
 
-  if (EMAIL_PROVIDER === "resend" || RESEND_API_KEY) {
+  if (EMAIL_PROVIDER === "smtp") {
+    if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) {
+      throw new Error("SMTP is not configured. Set SMTP_HOST, SMTP_USER, and SMTP_PASS.");
+    }
+
+    const transport = nodemailer.createTransport({
+      host: SMTP_HOST,
+      port: SMTP_PORT,
+      secure: SMTP_SECURE,
+      auth: {
+        user: SMTP_USER,
+        pass: SMTP_PASS,
+      },
+    });
+
+    await transport.sendMail({
+      from,
+      to,
+      subject,
+      html,
+    });
+
+    return;
+  }
+
+  if (RESEND_API_KEY && EMAIL_PROVIDER !== "sendgrid") {
     const response = await fetch("https://api.resend.com/emails", {
       method: "POST",
       headers: {
@@ -444,7 +491,7 @@ async function sendOtpEmail(to: string, subject: string, html: string) {
     return;
   }
 
-  throw new Error("No email provider configured. Set RESEND_API_KEY or SENDGRID_API_KEY for Deno Deploy.");
+  throw new Error("No email provider configured. Set EMAIL_PROVIDER=smtp, RESEND_API_KEY, or SENDGRID_API_KEY.");
 }
 
 async function storeOtpChallenge(params: {
@@ -499,6 +546,23 @@ async function findLatestOtpChallenge(email: string, purpose: OtpPurpose) {
   }
 
   return data ?? null;
+}
+
+async function enforceOtpCooldown(email: string, purpose: OtpPurpose) {
+  const latest = await findLatestOtpChallenge(email, purpose);
+  const retryAfterSeconds = getCooldownSecondsRemaining(latest?.created_at as string | null | undefined);
+
+  if (retryAfterSeconds > 0) {
+    return {
+      error: sendError("Please wait before requesting another OTP.", 429, {
+        field: "email",
+        error: "OTP_COOLDOWN",
+      }),
+      retryAfterSeconds,
+    };
+  }
+
+  return { latest, retryAfterSeconds: 0 };
 }
 
 async function markOtpUsed(id: string, extra: Record<string, unknown> = {}) {
@@ -678,6 +742,12 @@ async function sendOtp(request: Request) {
     return parsed.error;
   }
 
+  const cooldown = await enforceOtpCooldown(parsed.email, parsed.purpose);
+
+  if ("error" in cooldown) {
+    return cooldown.error;
+  }
+
   const code = generateOtpCode();
 
   try {
@@ -703,6 +773,8 @@ async function sendOtp(request: Request) {
         purpose: parsed.purpose,
         expiresAt: expiresAt.toISOString(),
         expiresInMinutes: OTP_EXPIRY_MINUTES,
+        retryAfterSeconds: OTP_COOLDOWN_SECONDS,
+        resendAvailableAt: new Date(Date.now() + OTP_COOLDOWN_SECONDS * 1000).toISOString(),
       },
     });
   } catch (error) {
@@ -762,6 +834,12 @@ async function resetPassword(request: Request) {
     return parsed.error;
   }
 
+  const cooldown = await enforceOtpCooldown(parsed.email, "recovery");
+
+  if ("error" in cooldown) {
+    return cooldown.error;
+  }
+
   const code = generateOtpCode();
 
   try {
@@ -787,6 +865,8 @@ async function resetPassword(request: Request) {
         purpose: "recovery",
         expiresAt: expiresAt.toISOString(),
         expiresInMinutes: OTP_EXPIRY_MINUTES,
+        retryAfterSeconds: OTP_COOLDOWN_SECONDS,
+        resendAvailableAt: new Date(Date.now() + OTP_COOLDOWN_SECONDS * 1000).toISOString(),
       },
     });
   } catch (error) {
