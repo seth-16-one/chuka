@@ -19,7 +19,17 @@ type ErrorPayload = {
 const EMAIL_PATTERN = /^\S+@\S+\.\S+$/;
 const OTP_PATTERN = /^\d{6}$/;
 const MIN_PASSWORD_LENGTH = 6;
-const ALLOWED_OTP_TYPES = new Set(["email", "recovery"]);
+type OtpPurpose = "login" | "signup" | "recovery";
+const ALLOWED_OTP_TYPES = new Set<OtpPurpose>(["login", "signup", "recovery"]);
+const OTP_EXPIRY_MINUTES = Number(Deno.env.get("OTP_EXPIRY_MINUTES") ?? "10");
+const OTP_MAX_ATTEMPTS = Number(Deno.env.get("OTP_MAX_ATTEMPTS") ?? "5");
+const OTP_HASH_SECRET = Deno.env.get("OTP_HASH_SECRET") ?? "change-me";
+const EMAIL_PROVIDER = (Deno.env.get("EMAIL_PROVIDER") ?? "").toLowerCase();
+const EMAIL_FROM_NAME = Deno.env.get("EMAIL_FROM_NAME") ?? "Chuka University";
+const EMAIL_FROM_ADDRESS = Deno.env.get("EMAIL_FROM_ADDRESS") ?? "no-reply@chuka.local";
+const RESEND_API_KEY = Deno.env.get("RESEND_API_KEY") ?? "";
+const SENDGRID_API_KEY = Deno.env.get("SENDGRID_API_KEY") ?? "";
+const APP_BASE_URL = Deno.env.get("APP_BASE_URL") ?? Deno.env.get("API_URL") ?? "";
 
 const TABLES = {
   announcements: { primaryKey: "id", orderBy: "published_at", orderDirection: "desc" },
@@ -179,10 +189,25 @@ function validateLoginBody(body: Record<string, unknown>) {
   return { email, password };
 }
 
-function validateOtpBody(body: Record<string, unknown>) {
+function validateSendOtpBody(body: Record<string, unknown>) {
+  const email = normalizeEmail(body.email);
+  const purpose = normalizePurpose(body.purpose);
+
+  if (!email) {
+    return { error: sendError("Email is required.", 400, { field: "email" }) };
+  }
+
+  if (!EMAIL_PATTERN.test(email)) {
+    return { error: sendError("Enter a valid email address.", 400, { field: "email" }) };
+  }
+
+  return { email, purpose };
+}
+
+function validateVerifyOtpBody(body: Record<string, unknown>) {
   const email = normalizeEmail(body.email);
   const token = typeof body.token === "string" ? body.token.trim() : "";
-  const type = typeof body.type === "string" ? body.type.trim() : "email";
+  const purpose = normalizePurpose(body.purpose);
 
   if (!email) {
     return { error: sendError("Email is required.", 400, { field: "email" }) };
@@ -200,11 +225,43 @@ function validateOtpBody(body: Record<string, unknown>) {
     return { error: sendError("OTP must be 6 digits.", 400, { field: "token" }) };
   }
 
-  if (!ALLOWED_OTP_TYPES.has(type)) {
-    return { error: sendError("OTP type must be email or recovery.", 400, { field: "type" }) };
+  return { email, token, purpose };
+}
+
+function validateRecoveryPasswordBody(body: Record<string, unknown>) {
+  const email = normalizeEmail(body.email);
+  const token = typeof body.token === "string" ? body.token.trim() : "";
+  const password = typeof body.password === "string" ? body.password.trim() : "";
+
+  if (!email) {
+    return { error: sendError("Email is required.", 400, { field: "email" }) };
   }
 
-  return { email, token, type: type as "email" | "recovery" };
+  if (!EMAIL_PATTERN.test(email)) {
+    return { error: sendError("Enter a valid email address.", 400, { field: "email" }) };
+  }
+
+  if (!token) {
+    return { error: sendError("OTP token is required.", 400, { field: "token" }) };
+  }
+
+  if (!OTP_PATTERN.test(token)) {
+    return { error: sendError("OTP must be 6 digits.", 400, { field: "token" }) };
+  }
+
+  if (!password) {
+    return { error: sendError("Password is required.", 400, { field: "password" }) };
+  }
+
+  if (password.length < MIN_PASSWORD_LENGTH) {
+    return {
+      error: sendError(`Password must be at least ${MIN_PASSWORD_LENGTH} characters.`, 400, {
+        field: "password",
+      }),
+    };
+  }
+
+  return { email, token, password };
 }
 
 function validatePasswordBody(body: Record<string, unknown>) {
@@ -255,6 +312,286 @@ function validateRegisterBody(body: Record<string, unknown>) {
   }
 
   return { name, email, password };
+}
+
+function normalizePurpose(value: unknown): OtpPurpose {
+  return value === "signup" || value === "recovery" || value === "login" ? value : "login";
+}
+
+function generateOtpCode() {
+  const digits = crypto.getRandomValues(new Uint32Array(1))[0] % 1_000_000;
+  return String(digits).padStart(6, "0");
+}
+
+async function sha256Base64(input: string) {
+  const bytes = new TextEncoder().encode(input);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const array = new Uint8Array(digest);
+  let binary = "";
+  for (const byte of array) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+async function hashOtp(email: string, purpose: string, code: string) {
+  return sha256Base64(`${OTP_HASH_SECRET}:${email}:${purpose}:${code}`);
+}
+
+async function hashToken(token: string) {
+  return sha256Base64(`${OTP_HASH_SECRET}:${token}`);
+}
+
+function buildOtpSubject(purpose: OtpPurpose) {
+  if (purpose === "signup") return "Verify your Chuka account";
+  if (purpose === "recovery") return "Reset your Chuka password";
+  return "Your Chuka login code";
+}
+
+function buildOtpIntro(purpose: OtpPurpose) {
+  if (purpose === "signup") return "Use this code to verify your new Chuka account.";
+  if (purpose === "recovery") return "Use this code to confirm your password reset.";
+  return "Use this code to finish signing in.";
+}
+
+function buildOtpEmailHtml(params: {
+  code: string;
+  purpose: OtpPurpose;
+  expiryMinutes: number;
+}) {
+  const { code, purpose, expiryMinutes } = params;
+  const label = purpose === "signup" ? "Account verification" : purpose === "recovery" ? "Password reset" : "Login verification";
+  const logoSvg = encodeURIComponent(`
+    <svg xmlns="http://www.w3.org/2000/svg" width="88" height="88" viewBox="0 0 88 88">
+      <rect width="88" height="88" rx="24" fill="#0b3d2e"/>
+      <circle cx="44" cy="44" r="28" fill="#5ff0c2"/>
+      <text x="44" y="52" text-anchor="middle" font-family="Arial, sans-serif" font-size="28" font-weight="700" fill="#0b3d2e">C</text>
+    </svg>
+  `);
+
+  return `<!doctype html>
+<html>
+  <body style="margin:0;padding:0;background:#07120d;font-family:Arial,Helvetica,sans-serif;">
+    <div style="max-width:640px;margin:0 auto;padding:32px 20px;">
+      <div style="background:linear-gradient(180deg,#0b3d2e 0%,#062416 100%);border:1px solid rgba(255,255,255,0.08);border-radius:28px;overflow:hidden;">
+        <div style="padding:32px 28px 18px;text-align:center;background:rgba(255,255,255,0.02);">
+          <img src="data:image/svg+xml;utf8,${logoSvg}" alt="Chuka logo" width="72" height="72" style="display:block;margin:0 auto 16px;" />
+          <div style="color:#f4fff8;font-size:28px;font-weight:800;line-height:1.1;">Chuka University</div>
+          <div style="color:#a7d8c7;font-size:14px;margin-top:8px;">${label}</div>
+        </div>
+        <div style="padding:28px;">
+          <div style="color:#f4fff8;font-size:18px;font-weight:700;margin-bottom:10px;">${buildOtpIntro(purpose)}</div>
+          <div style="color:#cfe4d4;font-size:14px;line-height:1.7;margin-bottom:24px;">
+            Enter the six-digit code below in the app to continue. It expires in ${expiryMinutes} minutes.
+          </div>
+          <div style="letter-spacing:10px;text-align:center;font-size:34px;font-weight:800;color:#5ff0c2;background:#062416;border:1px solid rgba(95,240,194,0.35);border-radius:18px;padding:18px 14px;margin:0 auto 24px;max-width:320px;">
+            ${code}
+          </div>
+          <div style="color:#8fb8aa;font-size:12px;line-height:1.6;text-align:center;">
+            If you did not request this, you can safely ignore this email.
+          </div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>`;
+}
+
+async function sendOtpEmail(to: string, subject: string, html: string) {
+  const from = `${EMAIL_FROM_NAME} <${EMAIL_FROM_ADDRESS}>`;
+
+  if (EMAIL_PROVIDER === "resend" || RESEND_API_KEY) {
+    const response = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${RESEND_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from,
+        to: [to],
+        subject,
+        html,
+      }),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Resend failed: ${text}`);
+    }
+
+    return;
+  }
+
+  if (EMAIL_PROVIDER === "sendgrid" || SENDGRID_API_KEY) {
+    const response = await fetch("https://api.sendgrid.com/v3/mail/send", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${SENDGRID_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        personalizations: [{ to: [{ email: to }] }],
+        from: { email: EMAIL_FROM_ADDRESS, name: EMAIL_FROM_NAME },
+        subject,
+        content: [{ type: "text/html", value: html }],
+      }),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`SendGrid failed: ${text}`);
+    }
+
+    return;
+  }
+
+  throw new Error("No email provider configured. Set RESEND_API_KEY or SENDGRID_API_KEY for Deno Deploy.");
+}
+
+async function storeOtpChallenge(params: {
+  email: string;
+  purpose: OtpPurpose;
+  code: string;
+}) {
+  const { email, purpose, code } = params;
+  const supabase = createSupabaseAdminClient();
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + OTP_EXPIRY_MINUTES * 60_000);
+  const codeHash = await hashOtp(email, purpose, code);
+
+  const record = {
+    id: crypto.randomUUID(),
+    email,
+    purpose,
+    code_hash: codeHash,
+    attempts: 0,
+    max_attempts: OTP_MAX_ATTEMPTS,
+    used_at: null,
+    expires_at: expiresAt.toISOString(),
+    created_at: now.toISOString(),
+    updated_at: now.toISOString(),
+  };
+
+  const { data, error } = await supabase.from("otp_verifications").insert(record).select("*").single();
+
+  if (error) {
+    throw error;
+  }
+
+  return {
+    challenge: data,
+    expiresAt,
+  };
+}
+
+async function findLatestOtpChallenge(email: string, purpose: OtpPurpose) {
+  const supabase = createSupabaseAdminClient();
+  const { data, error } = await supabase
+    .from("otp_verifications")
+    .select("*")
+    .eq("email", email)
+    .eq("purpose", purpose)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    throw error;
+  }
+
+  return data ?? null;
+}
+
+async function markOtpUsed(id: string, extra: Record<string, unknown> = {}) {
+  const supabase = createSupabaseAdminClient();
+  const { error } = await supabase.from("otp_verifications").update({
+    used_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    ...extra,
+  }).eq("id", id);
+
+  if (error) {
+    throw error;
+  }
+}
+
+async function incrementOtpAttempts(id: string, attempts: number) {
+  const supabase = createSupabaseAdminClient();
+  const { error } = await supabase
+    .from("otp_verifications")
+    .update({
+      attempts,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", id);
+
+  if (error) {
+    throw error;
+  }
+}
+
+function getOtpChallengeState(challenge: Record<string, unknown> | null) {
+  if (!challenge) {
+    return { exists: false, valid: false, expired: true, used: true, attemptsExceeded: false };
+  }
+
+  const now = Date.now();
+  const expiresAt = typeof challenge.expires_at === "string" ? Date.parse(challenge.expires_at) : NaN;
+  const attempts = Number(challenge.attempts ?? 0);
+  const maxAttempts = Number(challenge.max_attempts ?? OTP_MAX_ATTEMPTS);
+  const usedAt = challenge.used_at ? String(challenge.used_at) : "";
+
+  return {
+    exists: true,
+    valid: Boolean(challenge.code_hash) && Boolean(challenge.email) && Boolean(challenge.purpose),
+    expired: Number.isFinite(expiresAt) ? now > expiresAt : true,
+    used: Boolean(usedAt),
+    attemptsExceeded: attempts >= maxAttempts,
+    attempts,
+    maxAttempts,
+  };
+}
+
+async function verifyStoredOtpChallenge(params: {
+  email: string;
+  purpose: OtpPurpose;
+  token: string;
+}) {
+  const { email, purpose, token } = params;
+  const challenge = await findLatestOtpChallenge(email, purpose);
+  const state = getOtpChallengeState(challenge);
+
+  if (!state.exists || !state.valid) {
+    return { error: sendError("OTP challenge not found.", 404, { field: "token" }) };
+  }
+
+  if (state.used) {
+    return { error: sendError("This OTP has already been used.", 400, { field: "token" }) };
+  }
+
+  if (state.expired) {
+    return { error: sendError("This OTP has expired. Please request a new code.", 400, { field: "token" }) };
+  }
+
+  if (state.attemptsExceeded) {
+    return {
+      error: sendError(
+        "Too many invalid OTP attempts. Please request a new code.",
+        429,
+        { field: "token" },
+      ),
+    };
+  }
+
+  const expected = await hashOtp(email, purpose, token);
+
+  if (expected !== challenge.code_hash) {
+    await incrementOtpAttempts(String(challenge.id), state.attempts + 1);
+    return { error: sendError("Invalid OTP. Please try again.", 400, { field: "token" }) };
+  }
+
+  await markOtpUsed(String(challenge.id));
+
+  return { challenge };
 }
 
 async function requireSupabaseUser(request: Request) {
@@ -335,27 +672,45 @@ async function sendOtp(request: Request) {
   }
 
   const body = await readJsonBody(request);
-  const parsed = validateEmailBody(body);
+  const parsed = validateSendOtpBody(body);
 
   if ("error" in parsed) {
     return parsed.error;
   }
 
-  const client = createAuthClient();
-  const { data, error } = await client.auth.signInWithOtp({
-    email: parsed.email,
-    options: {
-      shouldCreateUser: false,
-    },
-  });
+  const code = generateOtpCode();
 
-  if (error) {
-    return sendError(error.message || "Failed to send OTP.", 400);
+  try {
+    const { expiresAt } = await storeOtpChallenge({
+      email: parsed.email,
+      purpose: parsed.purpose,
+      code,
+    });
+
+    await sendOtpEmail(
+      parsed.email,
+      buildOtpSubject(parsed.purpose),
+      buildOtpEmailHtml({
+        code,
+        purpose: parsed.purpose,
+        expiryMinutes: OTP_EXPIRY_MINUTES,
+      }),
+    );
+
+    return sendSuccess("OTP sent successfully.", {
+      email: parsed.email,
+      data: {
+        purpose: parsed.purpose,
+        expiresAt: expiresAt.toISOString(),
+        expiresInMinutes: OTP_EXPIRY_MINUTES,
+      },
+    });
+  } catch (error) {
+    return sendError(
+      error instanceof Error ? error.message : "Failed to send OTP.",
+      400,
+    );
   }
-
-  return sendSuccess("OTP sent successfully.", {
-    user: data.user ?? null,
-  });
 }
 
 async function verifyOtp(request: Request) {
@@ -364,27 +719,35 @@ async function verifyOtp(request: Request) {
   }
 
   const body = await readJsonBody(request);
-  const parsed = validateOtpBody(body);
+  const parsed = validateVerifyOtpBody(body);
 
   if ("error" in parsed) {
     return parsed.error;
   }
 
-  const client = createAuthClient();
-  const { data, error } = await client.auth.verifyOtp({
-    email: parsed.email,
-    token: parsed.token,
-    type: parsed.type,
-  });
+  try {
+    const result = await verifyStoredOtpChallenge({
+      email: parsed.email,
+      purpose: parsed.purpose,
+      token: parsed.token,
+    });
 
-  if (error) {
-    return sendError(error.message || "OTP verification failed.", 400);
+    if ("error" in result) {
+      return result.error;
+    }
+
+    return sendSuccess("OTP verified successfully.", {
+      email: parsed.email,
+      data: {
+        purpose: parsed.purpose,
+      },
+    });
+  } catch (error) {
+    return sendError(
+      error instanceof Error ? error.message : "OTP verification failed.",
+      400,
+    );
   }
-
-  return sendSuccess("OTP verified successfully.", {
-    session: data.session,
-    user: data.user,
-  });
 }
 
 async function resetPassword(request: Request) {
@@ -393,22 +756,45 @@ async function resetPassword(request: Request) {
   }
 
   const body = await readJsonBody(request);
-  const parsed = validateEmailBody(body);
+  const parsed = validateSendOtpBody({ ...body, purpose: "recovery" });
 
   if ("error" in parsed) {
     return parsed.error;
   }
 
-  const client = createAuthClient();
-  const { error } = await client.auth.resetPasswordForEmail(parsed.email);
+  const code = generateOtpCode();
 
-  if (error) {
-    return sendError(error.message || "Failed to send reset OTP.", 400);
+  try {
+    const { expiresAt } = await storeOtpChallenge({
+      email: parsed.email,
+      purpose: "recovery",
+      code,
+    });
+
+    await sendOtpEmail(
+      parsed.email,
+      buildOtpSubject("recovery"),
+      buildOtpEmailHtml({
+        code,
+        purpose: "recovery",
+        expiryMinutes: OTP_EXPIRY_MINUTES,
+      }),
+    );
+
+    return sendSuccess("Reset OTP sent successfully.", {
+      email: parsed.email,
+      data: {
+        purpose: "recovery",
+        expiresAt: expiresAt.toISOString(),
+        expiresInMinutes: OTP_EXPIRY_MINUTES,
+      },
+    });
+  } catch (error) {
+    return sendError(
+      error instanceof Error ? error.message : "Failed to send reset OTP.",
+      400,
+    );
   }
-
-  return sendSuccess("Reset OTP sent successfully.", {
-    email: parsed.email,
-  });
 }
 
 async function register(request: Request) {
@@ -451,9 +837,19 @@ async function register(request: Request) {
     }
   }
 
+  const client = createAuthClient();
+  const { data: sessionData, error: sessionError } = await client.auth.signInWithPassword({
+    email: parsed.email,
+    password: parsed.password,
+  });
+
+  if (sessionError) {
+    return sendError(sessionError.message || "Registration completed, but session could not be created.", 400);
+  }
+
   return sendSuccess("Registration created successfully.", {
-    session: data.session,
-    user: data.user,
+    session: sessionData.session,
+    user: sessionData.user ?? data.user,
   });
 }
 
@@ -462,35 +858,57 @@ async function updatePassword(request: Request) {
     return sendError("Supabase configuration is missing.", 500);
   }
 
-  const authorization = request.headers.get("authorization") ?? "";
-  const accessToken = authorization.startsWith("Bearer ") ? authorization.slice(7).trim() : "";
-
-  if (!accessToken) {
-    return sendError("Missing access token.", 401);
-  }
-
   const body = await readJsonBody(request);
-  const parsed = validatePasswordBody(body);
+  const parsed = validateRecoveryPasswordBody(body);
 
   if ("error" in parsed) {
     return parsed.error;
   }
 
-  const client = createAuthClient({
-    Authorization: `Bearer ${accessToken}`,
+  const verification = await verifyStoredOtpChallenge({
+    email: parsed.email,
+    purpose: "recovery",
+    token: parsed.token,
   });
 
-  const { data, error } = await client.auth.updateUser({
-    password: parsed.password,
-  });
-
-  if (error) {
-    return sendError(error.message || "Failed to update password.", 400);
+  if ("error" in verification) {
+    return verification.error;
   }
 
-  return sendSuccess("Password updated successfully.", {
-    user: data.user,
-  });
+  try {
+    const adminClient = createSupabaseAdminClient();
+    const { data: users, error: usersError } = await adminClient.auth.admin.listUsers({
+      perPage: 1000,
+    });
+
+    if (usersError) {
+      return sendError(usersError.message || "Unable to locate account.", 400);
+    }
+
+    const user = users.users.find((entry) => entry.email?.toLowerCase() === parsed.email);
+
+    if (!user?.id) {
+      return sendError("No account found for this email address.", 404, { field: "email" });
+    }
+
+    const { data, error } = await adminClient.auth.admin.updateUserById(user.id, {
+      password: parsed.password,
+    });
+
+    if (error) {
+      return sendError(error.message || "Failed to update password.", 400);
+    }
+
+    return sendSuccess("Password updated successfully.", {
+      user: data.user,
+      email: parsed.email,
+    });
+  } catch (error) {
+    return sendError(
+      error instanceof Error ? error.message : "Failed to update password.",
+      400,
+    );
+  }
 }
 
 async function listRecords(request: Request, table: string) {
