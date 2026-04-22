@@ -1,5 +1,4 @@
 import { createClient, type Session, type User } from "npm:@supabase/supabase-js@2";
-import nodemailer from "npm:nodemailer@6.10.1";
 
 type SuccessPayload = {
   status: "ok";
@@ -417,6 +416,163 @@ function buildOtpEmailHtml(params: {
 </html>`;
 }
 
+type SmtpSendParams = {
+  host: string;
+  port: number;
+  secure: boolean;
+  username: string;
+  password: string;
+  from: string;
+  to: string;
+  subject: string;
+  html: string;
+};
+
+function encodeBase64Utf8(value: string) {
+  return btoa(value);
+}
+
+function buildSmtpMessage(params: Pick<SmtpSendParams, "from" | "to" | "subject" | "html">) {
+  const body = params.html
+    .replace(/\r?\n/g, "\r\n")
+    .split("\r\n")
+    .map((line) => (line.startsWith(".") ? `.${line}` : line))
+    .join("\r\n");
+
+  return [
+    `From: ${params.from}`,
+    `To: ${params.to}`,
+    `Subject: ${params.subject}`,
+    "MIME-Version: 1.0",
+    'Content-Type: text/html; charset="UTF-8"',
+    "Content-Transfer-Encoding: 8bit",
+    "",
+    body,
+  ].join("\r\n");
+}
+
+async function readSmtpResponse(conn: Deno.Conn) {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const lines: string[] = [];
+  let code = 0;
+
+  while (true) {
+    const newlineIndex = buffer.indexOf("\n");
+    if (newlineIndex >= 0) {
+      const line = buffer.slice(0, newlineIndex).replace(/\r$/, "");
+      buffer = buffer.slice(newlineIndex + 1);
+      lines.push(line);
+
+      const match = line.match(/^(\d{3})([-\s])/);
+      if (match) {
+        code = Number(match[1]);
+        if (match[2] === " ") {
+          return { code, lines, text: lines.join("\n") };
+        }
+      } else if (code && /^\d{3} /.test(line)) {
+        return { code, lines, text: lines.join("\n") };
+      }
+      continue;
+    }
+
+    const chunk = new Uint8Array(1024);
+    const read = await conn.read(chunk);
+
+    if (read === null) {
+      if (buffer.length > 0) {
+        lines.push(buffer);
+      }
+      return { code, lines, text: lines.join("\n") };
+    }
+
+    buffer += decoder.decode(chunk.subarray(0, read), { stream: true });
+  }
+}
+
+async function writeSmtpLine(conn: Deno.Conn, line: string) {
+  await conn.write(new TextEncoder().encode(`${line}\r\n`));
+}
+
+async function sendSmtpMessage(params: SmtpSendParams) {
+  let conn: Deno.Conn | Deno.TlsConn;
+
+  if (params.secure) {
+    conn = await Deno.connectTls({ hostname: params.host, port: params.port });
+  } else {
+    conn = await Deno.connect({ hostname: params.host, port: params.port });
+  }
+
+  try {
+    let response = await readSmtpResponse(conn);
+    if (response.code >= 400) {
+      throw new Error(`SMTP greeting failed: ${response.text}`);
+    }
+
+    const ehloHost = APP_BASE_URL || "localhost";
+    await writeSmtpLine(conn, `EHLO ${ehloHost}`);
+    response = await readSmtpResponse(conn);
+
+    if (!params.secure && response.text.includes("STARTTLS")) {
+      await writeSmtpLine(conn, "STARTTLS");
+      response = await readSmtpResponse(conn);
+      if (response.code !== 220) {
+        throw new Error(`SMTP STARTTLS failed: ${response.text}`);
+      }
+
+      conn = await Deno.startTls(conn as Deno.Conn, { hostname: params.host });
+      await writeSmtpLine(conn, `EHLO ${ehloHost}`);
+      response = await readSmtpResponse(conn);
+    }
+
+    await writeSmtpLine(conn, "AUTH LOGIN");
+    response = await readSmtpResponse(conn);
+    if (response.code !== 334) {
+      throw new Error(`SMTP AUTH LOGIN was rejected: ${response.text}`);
+    }
+
+    await writeSmtpLine(conn, encodeBase64Utf8(params.username));
+    response = await readSmtpResponse(conn);
+    if (response.code !== 334) {
+      throw new Error(`SMTP username was rejected: ${response.text}`);
+    }
+
+    await writeSmtpLine(conn, encodeBase64Utf8(params.password));
+    response = await readSmtpResponse(conn);
+    if (response.code !== 235) {
+      throw new Error(`SMTP authentication failed: ${response.text}`);
+    }
+
+    await writeSmtpLine(conn, `MAIL FROM:<${EMAIL_FROM_ADDRESS}>`);
+    response = await readSmtpResponse(conn);
+    if (response.code !== 250) {
+      throw new Error(`SMTP MAIL FROM failed: ${response.text}`);
+    }
+
+    await writeSmtpLine(conn, `RCPT TO:<${params.to}>`);
+    response = await readSmtpResponse(conn);
+    if (response.code !== 250 && response.code !== 251) {
+      throw new Error(`SMTP RCPT TO failed: ${response.text}`);
+    }
+
+    await writeSmtpLine(conn, "DATA");
+    response = await readSmtpResponse(conn);
+    if (response.code !== 354) {
+      throw new Error(`SMTP DATA was rejected: ${response.text}`);
+    }
+
+    await conn.write(new TextEncoder().encode(`${buildSmtpMessage(params)}\r\n.\r\n`));
+    response = await readSmtpResponse(conn);
+    if (response.code !== 250) {
+      throw new Error(`SMTP message send failed: ${response.text}`);
+    }
+
+    await writeSmtpLine(conn, "QUIT");
+  } finally {
+    conn.close();
+  }
+}
+
 async function sendOtpEmail(to: string, subject: string, html: string) {
   const from = `${EMAIL_FROM_NAME} <${EMAIL_FROM_ADDRESS}>`;
 
@@ -425,17 +581,12 @@ async function sendOtpEmail(to: string, subject: string, html: string) {
       throw new Error("SMTP is not configured. Set SMTP_HOST, SMTP_USER, and SMTP_PASS.");
     }
 
-    const transport = nodemailer.createTransport({
+    await sendSmtpMessage({
       host: SMTP_HOST,
       port: SMTP_PORT,
       secure: SMTP_SECURE,
-      auth: {
-        user: SMTP_USER,
-        pass: SMTP_PASS,
-      },
-    });
-
-    await transport.sendMail({
+      username: SMTP_USER,
+      password: SMTP_PASS,
       from,
       to,
       subject,
