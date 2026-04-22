@@ -16,6 +16,8 @@ API_URL=https://your-deployed-backend-url
 PORT=8000
 ```
 
+For OTP emails, configure your Supabase Auth email templates to use `{{ .Token }}` instead of `{{ .ConfirmationURL }}` so users receive a code they can enter in the app.
+
 ## Local Run
 
 ```bash

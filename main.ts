@@ -344,6 +344,9 @@ async function sendOtp(request: Request) {
   const client = createAuthClient();
   const { data, error } = await client.auth.signInWithOtp({
     email: parsed.email,
+    options: {
+      shouldCreateUser: false,
+    },
   });
 
   if (error) {
@@ -420,10 +423,14 @@ async function register(request: Request) {
     return parsed.error;
   }
 
-  const client = createAuthClient();
-  const { data, error } = await client.auth.signUp({
+  const adminClient = createSupabaseAdminClient();
+  const { data, error } = await adminClient.auth.admin.createUser({
     email: parsed.email,
     password: parsed.password,
+    email_confirm: true,
+    user_metadata: {
+      name: parsed.name,
+    },
   });
 
   if (error) {
@@ -431,7 +438,6 @@ async function register(request: Request) {
   }
 
   if (data.user?.id) {
-    const adminClient = createSupabaseAdminClient();
     const { error: profileError } = await adminClient.from("profiles").upsert({
       id: data.user.id,
       full_name: parsed.name,
