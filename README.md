@@ -25,6 +25,8 @@ SMTP_PASS=your-gmail-app-password
 RESEND_API_KEY=
 OTP_COOLDOWN_SECONDS=60
 OTP_EXPIRY_MINUTES=10
+OTP_MAX_ATTEMPTS=5
+OTP_HASH_SECRET=your-otp-secret
 ```
 
 OTP emails can be sent through Gmail SMTP or Resend. If you use Gmail, set an app password and keep `EMAIL_PROVIDER=smtp`.

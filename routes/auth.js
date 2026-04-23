@@ -14,7 +14,6 @@ const {
   validatePasswordBody,
   validateRegisterBody,
 } = require("../middleware/authValidation");
-const { requireBearerToken } = require("../middleware/requireBearerToken");
 
 const router = express.Router();
 
@@ -23,6 +22,6 @@ router.post("/otp", validateEmailBody, sendOtp);
 router.post("/verify", validateOtpBody, verifyOtp);
 router.post("/reset", validateEmailBody, resetPassword);
 router.post("/register", validateRegisterBody, register);
-router.post("/password", requireBearerToken, validatePasswordBody, updatePassword);
+router.post("/password", validateEmailBody, validateOtpBody, validatePasswordBody, updatePassword);
 
 module.exports = router;

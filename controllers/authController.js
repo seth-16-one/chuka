@@ -19,6 +19,7 @@ function createAuthClient(extraHeaders = {}) {
   });
 }
 
+
 function sendSuccess(res, message, payload = {}) {
   return res.status(200).json({
     status: "ok",

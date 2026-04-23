@@ -1,7 +1,7 @@
 const EMAIL_PATTERN = /^\S+@\S+\.\S+$/;
 const OTP_PATTERN = /^\d{6}$/;
 const MIN_PASSWORD_LENGTH = 6;
-const ALLOWED_OTP_TYPES = new Set(["email", "recovery"]);
+const ALLOWED_OTP_TYPES = new Set(["email", "login", "signup", "recovery", "password_reset"]);
 
 function respondWithValidationError(res, message, field) {
   return res.status(400).json({
@@ -54,7 +54,13 @@ function validateLoginBody(req, res, next) {
 function validateOtpBody(req, res, next) {
   const email = normalizeEmail(req.body?.email);
   const token = typeof req.body?.token === "string" ? req.body.token.trim() : "";
-  const type = typeof req.body?.type === "string" ? req.body.type.trim() : "email";
+  const rawPurpose =
+    typeof req.body?.purpose === "string"
+      ? req.body.purpose.trim()
+      : typeof req.body?.type === "string"
+        ? req.body.type.trim()
+        : "login";
+  const type = rawPurpose === "password_reset" ? "recovery" : rawPurpose;
 
   if (!email) {
     return respondWithValidationError(res, "Email is required.", "email");
@@ -73,12 +79,16 @@ function validateOtpBody(req, res, next) {
   }
 
   if (!ALLOWED_OTP_TYPES.has(type)) {
-    return respondWithValidationError(res, "OTP type must be email or recovery.", "type");
+    return respondWithValidationError(
+      res,
+      "OTP purpose must be login, signup, recovery, or email.",
+      "purpose",
+    );
   }
 
   req.body.email = email;
   req.body.token = token;
-  req.body.type = type;
+  req.body.purpose = type === "email" ? "login" : type;
   return next();
 }
 
