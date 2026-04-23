@@ -1,9 +1,21 @@
 const { createClient } = require("@supabase/supabase-js");
 const env = require("../config/env");
 const { createSupabaseAdminClient } = require("../lib/supabaseAdmin");
+const {
+  clearOtpChallenge,
+  createOtpChallenge,
+  consumeRecoveryChallenge,
+  normalizePurpose,
+  verifyOtpChallenge,
+} = require("../lib/otp");
+const { sendOtpEmail } = require("../lib/mailer");
 
 function hasSupabaseConfig() {
   return Boolean(env.supabaseUrl && env.supabaseAnonKey);
+}
+
+function hasSupabaseAdminConfig() {
+  return Boolean(env.supabaseUrl && env.supabaseServiceRoleKey);
 }
 
 function createAuthClient(extraHeaders = {}) {
@@ -65,29 +77,43 @@ async function login(req, res) {
 
 async function sendOtp(req, res) {
   try {
-    if (!hasSupabaseConfig()) {
+    if (!env.otpHashSecret) {
       return res.status(500).json({
         status: "error",
-        message: "Supabase configuration is missing.",
+        message: "OTP configuration is missing.",
       });
     }
 
-    const client = createAuthClient();
-    const { data, error } = await client.auth.signInWithOtp({
+    const purpose = normalizePurpose(req.body.purpose);
+    const { code, resendAvailableAt } = createOtpChallenge({
       email: req.body.email,
+      purpose,
     });
 
-    if (error) {
-      return res.status(400).json({
-        status: "error",
-        message: error.message || "Failed to send OTP.",
-      });
-    }
+    await sendOtpEmail({
+      email: req.body.email,
+      code,
+      expiresInMinutes: env.otpExpiryMinutes,
+      purpose,
+    });
 
     return sendSuccess(res, "OTP sent successfully.", {
-      user: data.user ?? null,
+      email: req.body.email,
+      data: {
+        resendAvailableAt,
+      },
     });
   } catch (error) {
+    if (error?.code === "OTP_COOLDOWN") {
+      return res.status(429).json({
+        status: "error",
+        message: error.message || "Please wait before requesting another OTP.",
+        data: {
+          resendAvailableAt: error.resendAvailableAt,
+        },
+      });
+    }
+
     return res.status(500).json({
       status: "error",
       message: "Unable to send OTP.",
@@ -98,30 +124,29 @@ async function sendOtp(req, res) {
 
 async function verifyOtp(req, res) {
   try {
-    if (!hasSupabaseConfig()) {
+    if (!env.otpHashSecret) {
       return res.status(500).json({
         status: "error",
-        message: "Supabase configuration is missing.",
+        message: "OTP configuration is missing.",
       });
     }
 
-    const client = createAuthClient();
-    const { data, error } = await client.auth.verifyOtp({
+    const result = verifyOtpChallenge({
       email: req.body.email,
       token: req.body.token,
-      type: req.body.type,
+      purpose: req.body.purpose,
     });
 
-    if (error) {
+    if (!result.ok) {
       return res.status(400).json({
         status: "error",
-        message: error.message || "OTP verification failed.",
+        message: result.message || "OTP verification failed.",
       });
     }
 
     return sendSuccess(res, "OTP verified successfully.", {
-      session: data.session,
-      user: data.user,
+      email: req.body.email,
+      purpose: req.body.purpose,
     });
   } catch (error) {
     return res.status(500).json({
@@ -134,27 +159,42 @@ async function verifyOtp(req, res) {
 
 async function resetPassword(req, res) {
   try {
-    if (!hasSupabaseConfig()) {
+    if (!env.otpHashSecret) {
       return res.status(500).json({
         status: "error",
-        message: "Supabase configuration is missing.",
+        message: "OTP configuration is missing.",
       });
     }
 
-    const client = createAuthClient();
-    const { error } = await client.auth.resetPasswordForEmail(req.body.email);
+    const { code, resendAvailableAt } = createOtpChallenge({
+      email: req.body.email,
+      purpose: "recovery",
+    });
 
-    if (error) {
-      return res.status(400).json({
-        status: "error",
-        message: error.message || "Failed to send reset OTP.",
-      });
-    }
+    await sendOtpEmail({
+      email: req.body.email,
+      code,
+      expiresInMinutes: env.otpExpiryMinutes,
+      purpose: "recovery",
+    });
 
     return sendSuccess(res, "Reset OTP sent successfully.", {
       email: req.body.email,
+      data: {
+        resendAvailableAt,
+      },
     });
   } catch (error) {
+    if (error?.code === "OTP_COOLDOWN") {
+      return res.status(429).json({
+        status: "error",
+        message: error.message || "Please wait before requesting another OTP.",
+        data: {
+          resendAvailableAt: error.resendAvailableAt,
+        },
+      });
+    }
+
     return res.status(500).json({
       status: "error",
       message: "Unable to send reset OTP.",
@@ -165,17 +205,22 @@ async function resetPassword(req, res) {
 
 async function register(req, res) {
   try {
-    if (!hasSupabaseConfig()) {
+    if (!hasSupabaseAdminConfig()) {
       return res.status(500).json({
         status: "error",
-        message: "Supabase configuration is missing.",
+        message: "Supabase service role configuration is missing.",
       });
     }
 
-    const client = createAuthClient();
-    const { data, error } = await client.auth.signUp({
+    const adminClient = createSupabaseAdminClient();
+    const { data, error } = await adminClient.auth.admin.createUser({
       email: req.body.email,
       password: req.body.password,
+      email_confirm: true,
+      user_metadata: {
+        full_name: req.body.name,
+        role: "student",
+      },
     });
 
     if (error) {
@@ -186,7 +231,6 @@ async function register(req, res) {
     }
 
     if (data.user?.id) {
-      const adminClient = createSupabaseAdminClient();
       const { error: profileError } = await adminClient.from("profiles").upsert({
         id: data.user.id,
         full_name: req.body.name,
@@ -203,9 +247,22 @@ async function register(req, res) {
       }
     }
 
+    const client = createAuthClient();
+    const { data: sessionData, error: signInError } = await client.auth.signInWithPassword({
+      email: req.body.email,
+      password: req.body.password,
+    });
+
+    if (signInError) {
+      return res.status(400).json({
+        status: "error",
+        message: signInError.message || "Unable to create session.",
+      });
+    }
+
     return sendSuccess(res, "Registration created successfully.", {
-      session: data.session,
-      user: data.user,
+      session: sessionData.session,
+      user: sessionData.user,
     });
   } catch (error) {
     return res.status(500).json({
@@ -218,18 +275,56 @@ async function register(req, res) {
 
 async function updatePassword(req, res) {
   try {
-    if (!hasSupabaseConfig()) {
+    if (!env.otpHashSecret) {
       return res.status(500).json({
         status: "error",
-        message: "Supabase configuration is missing.",
+        message: "OTP configuration is missing.",
       });
     }
 
-    const client = createAuthClient({
-      Authorization: `Bearer ${req.accessToken}`,
+    if (!hasSupabaseAdminConfig()) {
+      return res.status(500).json({
+        status: "error",
+        message: "Supabase service role configuration is missing.",
+      });
+    }
+
+    const result = consumeRecoveryChallenge(req.body.email, req.body.token);
+
+    if (!result.ok) {
+      return res.status(400).json({
+        status: "error",
+        message: result.message || "OTP verification failed.",
+      });
+    }
+
+    clearOtpChallenge(req.body.email, "recovery");
+
+    const adminClient = createSupabaseAdminClient();
+    const { data: usersResponse, error: listError } = await adminClient.auth.admin.listUsers({
+      page: 1,
+      perPage: 1000,
     });
 
-    const { data, error } = await client.auth.updateUser({
+    if (listError) {
+      return res.status(400).json({
+        status: "error",
+        message: listError.message || "Failed to locate user.",
+      });
+    }
+
+    const matchedUser = usersResponse?.users?.find(
+      (user) => String(user.email || "").trim().toLowerCase() === req.body.email,
+    );
+
+    if (!matchedUser?.id) {
+      return res.status(404).json({
+        status: "error",
+        message: "No account was found for this email address.",
+      });
+    }
+
+    const { data, error } = await adminClient.auth.admin.updateUserById(matchedUser.id, {
       password: req.body.password,
     });
 
